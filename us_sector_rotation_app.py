@@ -1,724 +1,334 @@
 """
-美股板塊輪動 RRG（動畫版）— Prototype v2
-=======================================
-
-跟前一版的差異：
-    1. 真正的動畫播放：右下角有播放鍵＋時間滑桿，可以看板塊泡泡
-       隨時間在四象限之間移動的完整過程，不再只是靜態尾跡線。
-    2. 泡泡大小 = 資金流量（成交金額 price × volume 的滾動平均），
-       美股沒有台灣「三大法人買賣超」那種公開籌碼資料，但 Volume
-       本身就是市場真實資金進出的紀錄，用成交金額當「大戶／資金
-       關注度」的代理指標是業界常見做法（愈多錢流入，泡泡愈大）。
-
-X軸 = RS-Ratio（相對大盤強度，100為中性）
-Y軸 = RS-Momentum（強度變化動能，100為中性）
-四象限：領先 Leading／轉弱 Weakening／落後 Lagging／改善 Improving
-
-★ 目前為模擬資料（含模擬成交量），週數只是序號(第0週...第N週)，
-   不對應真實日期。接上 yfinance 之後，滑桿會自動顯示真實的
-   每週日期（因為 week_idx 只是索引，改用真實資料的 DataFrame
-   index 即可，畫圖邏輯完全不用改）。
-
-★ 接真實資料只要把 fetch_price_volume_data() 換成 yfinance 版本即可，
-   下面所有計算、動畫、畫圖邏輯完全不用改。
-
-真實資料範例（本機執行，需要網路）：
-    import yfinance as yf
-    def fetch_price_volume_data(tickers, period="2y", interval="1wk"):
-        data = yf.download(tickers, period=period, interval=interval, group_by="ticker")
-        out = {}
-        for t in tickers:
-            out[t] = pd.DataFrame({
-                "close": data[t]["Close"],
-                "volume": data[t]["Volume"],
-            }).dropna()
-        return out
-
-執行方式：
-    pip3 install yfinance streamlit plotly pandas numpy
-    python3 -m streamlit run us_sector_rotation_app.py
+USBB 美股板塊輪動 · 四季輪轉
+白貓黑帶師父浮世繪風格｜Streamlit + yfinance + Plotly
 """
+import base64
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
+
+# ---------------------------------------------------------------- 設定
+BENCH = "SPY"
+SECTORS = {
+    "XLK": "科技", "XLC": "通訊服務", "XLY": "非必需消費", "XLF": "金融",
+    "XLI": "工業", "XLV": "醫療保健", "XLE": "能源", "XLB": "原物料",
+    "XLP": "必需消費", "XLU": "公用事業", "XLRE": "房地產",
+}
+# 浮世繪色系，11 色容易分辨
+COLORS = {
+    "XLK": "#1A3A52", "XLC": "#6B4C9A", "XLY": "#C0392B", "XLF": "#2E7D6B",
+    "XLI": "#7A4E2D", "XLV": "#D4679A", "XLE": "#E08E0B", "XLB": "#5B7F2B",
+    "XLP": "#3D7CB8", "XLU": "#8A6D12", "XLRE": "#555555",
+}
+MONTHS_BACK = 36          # 可查詢三年
+WINDOW = 14               # RS-Ratio 平滑週期（週）
+MOM_WINDOW = 6            # RS-Momentum 平滑週期（週）
+
+SEASONS = {
+    "spring": {"name": "春", "label": "改善", "desc": "相對強度還在大盤之下，但動能已經回升。像冬雪剛化、花苞初開，值得開始留意。", "color": "#F6D6DE", "ink": "#B0476A", "img": "spring", "pos": "50% 45%"},
+    "summer": {"name": "夏", "label": "領先", "desc": "強度和動能都贏過大盤，資金正在這裡。領頭股最常出現在這一季。", "color": "#DCEBD3", "ink": "#2F7D55", "img": "summer", "pos": "50% 12%"},
+    "autumn": {"name": "秋", "label": "轉弱", "desc": "強度還在大盤之上，但動能開始下降。高峰已過，持有的人要提高警覺。", "color": "#F6DDC8", "ink": "#B5541C", "img": "autumn", "pos": "50% 18%"},
+    "winter": {"name": "冬", "label": "落後", "desc": "強度和動能都輸給大盤。休養生息的階段，等待春天回來。", "color": "#DDE6EE", "ink": "#46647E", "img": "winter", "pos": "50% 35%"},
+}
+ORDER = ["spring", "summer", "autumn", "winter"]
+
+ASSETS = Path(__file__).parent / "assets"
+
+st.set_page_config(page_title="美股板塊輪動｜AI美股黑帶學院", page_icon="🐈", layout="wide")
+
+
+# ---------------------------------------------------------------- 圖片
+def img_uri(name: str):
+    for ext in ("webp", "png", "jpg", "jpeg"):
+        p = ASSETS / f"{name}.{ext}"
+        if p.exists():
+            mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+            return f"data:image/{mime};base64," + base64.b64encode(p.read_bytes()).decode()
+    return None
+
+
+# ---------------------------------------------------------------- 樣式
+st.markdown("""
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;900&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--navy:#1A3A52; --gold:#D4AF37; --paper:#F5F3EC; --ink:#1E2A33; --muted:#5B6B77}
+html, body, [class*="css"], .stApp{font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+.stApp{background:var(--paper)}
+h1,h2,h3,.serif{font-family:"Noto Serif TC","Songti TC",serif !important; color:var(--navy)}
+.block-container{padding-top:1.2rem; max-width:1280px}
+.banner{position:relative; border-radius:6px; overflow:hidden; margin-bottom:1.2rem; background:var(--navy); display:grid; grid-template-columns:minmax(0,5fr) minmax(0,7fr); align-items:center; min-height:300px}
+.banner img{grid-column:2; grid-row:1; display:block; width:100%; height:300px; object-fit:cover; object-position:50% 55%; -webkit-mask-image:linear-gradient(90deg,transparent 0,#000 28%); mask-image:linear-gradient(90deg,transparent 0,#000 28%)}
+.banner .txt{grid-column:1; grid-row:1; position:relative; z-index:1; padding:28px 0 28px 36px; margin-right:-8%; color:#fff}
+.banner h1{color:#fff !important; font-size:clamp(26px,3.2vw,40px); margin:0 0 10px; padding:0; line-height:1.3}
+.banner p{margin:0; color:#E6EDF2; font-size:16px; line-height:1.7}
+.banner.noimg{display:block; min-height:0} .banner.noimg .txt{margin:0; padding:28px 36px}
+@media (max-width:760px){
+  .banner{display:flex; flex-direction:column; min-height:0}
+  .banner .txt{order:-1; margin:0; padding:24px 20px 0}
+  .banner img{height:220px; margin-top:-30px; -webkit-mask-image:linear-gradient(180deg,transparent 0,#000 30%); mask-image:linear-gradient(180deg,transparent 0,#000 30%)}
+}
+.season{border-radius:6px; overflow:hidden; background:#fff; border:1px solid #E3DED0; height:100%}
+.season img{display:block; width:100%; aspect-ratio:4/3; object-fit:cover}
+.season .hd{padding:12px 16px 4px; font-family:"Noto Serif TC",serif; font-weight:900; font-size:22px}
+.season .hd small{font-family:"Noto Sans TC",sans-serif; font-weight:500; font-size:14px; margin-left:6px; opacity:.8}
+.season .ds{padding:0 16px 8px; font-size:13.5px; color:var(--muted); line-height:1.6}
+.season ul{list-style:none; margin:0; padding:4px 16px 14px}
+.season li{display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-top:1px dashed #E3DED0; font-size:15px}
+.season li .mv{font-size:13px; color:var(--muted); white-space:nowrap}
+.season li.new .mv{color:var(--ink); font-weight:700}
+.season .empty{padding:6px 16px 16px; font-size:14px; color:var(--muted)}
+.dot{display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; vertical-align:1px}
+.note{font-size:13px; color:var(--muted)}
+.stTabs [data-baseweb="tab"]{font-family:"Noto Serif TC",serif; font-weight:600; font-size:16px}
+footer, #MainMenu{visibility:hidden}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- 資料
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_prices() -> pd.DataFrame:
+    tickers = list(SECTORS) + [BENCH]
+    raw = yf.download(tickers, period="5y", interval="1wk", auto_adjust=True, progress=False)
+    close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    return close.dropna(how="all").ffill()
+
+
+def compute_rrg(close: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """JdK RRG 近似算法：相對強度 → 平滑比率 → 動能。以 100 為中心。"""
+    bench = close[BENCH]
+    ratio, mom = {}, {}
+    for t in SECTORS:
+        if t not in close:
+            continue
+        rs = 100 * close[t] / bench
+        r = 100 * rs.ewm(span=WINDOW).mean() / rs.rolling(WINDOW * 2).mean()
+        m = 100 * r / r.rolling(MOM_WINDOW).mean()
+        ratio[t], mom[t] = r, m
+    ratio, mom = pd.DataFrame(ratio), pd.DataFrame(mom)
+    ok = ratio.notna().all(axis=1) & mom.notna().all(axis=1)
+    return ratio[ok], mom[ok]
+
+
+def season_of(r: float, m: float) -> str:
+    if r >= 100 and m >= 100:
+        return "summer"
+    if r >= 100:
+        return "autumn"
+    if m >= 100:
+        return "spring"
+    return "winter"
+
+
+def month_ends(index: pd.DatetimeIndex) -> pd.Series:
+    """每個月最後一個週資料點。"""
+    s = pd.Series(index, index=index)
+    return s.groupby(index.to_period("M")).max()
+
+
+# ---------------------------------------------------------------- 圖表
+def quadrant_shapes(xr, yr):
+    x0, x1 = xr
+    y0, y1 = yr
+    boxes = [("spring", x0, 100, 100, y1), ("summer", 100, x1, 100, y1),
+             ("autumn", 100, x1, y0, 100), ("winter", x0, 100, y0, 100)]
+    shapes, notes = [], []
+    for key, a, b, c, d in boxes:
+        s = SEASONS[key]
+        shapes.append(dict(type="rect", x0=a, x1=b, y0=c, y1=d, fillcolor=s["color"], opacity=.55, line_width=0, layer="below"))
+        notes.append(dict(x=a + (b - a) * (0.06 if a < 100 else 0.94), y=c + (d - c) * (0.93 if c >= 100 else 0.07),
+                          text=f"<b>{s['name']}</b>　{s['label']}", showarrow=False, font=dict(size=15, color=s["ink"], family="Noto Serif TC, serif"),
+                          xanchor="left" if a < 100 else "right"))
+    shapes += [dict(type="line", x0=100, x1=100, y0=y0, y1=y1, line=dict(color="#1A3A52", width=1, dash="dot")),
+               dict(type="line", x0=x0, x1=x1, y0=100, y1=100, line=dict(color="#1A3A52", width=1, dash="dot"))]
+    return shapes, notes
+
+
+def axis_range(ratio, mom, cols):
+    pad = .4
+    xs, ys = ratio[cols].values, mom[cols].values
+    xr = max(abs(np.nanmin(xs) - 100), abs(np.nanmax(xs) - 100)) + pad
+    yr = max(abs(np.nanmin(ys) - 100), abs(np.nanmax(ys) - 100)) + pad
+    return (100 - xr, 100 + xr), (100 - yr, 100 + yr)
+
+
+def base_layout(xr, yr, height=620):
+    shapes, notes = quadrant_shapes(xr, yr)
+    return dict(
+        height=height, shapes=shapes, annotations=notes, showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FBFAF5", margin=dict(l=40, r=20, t=20, b=40),
+        xaxis=dict(range=xr, title="相對強度（右邊 = 比大盤強）", zeroline=False, gridcolor="#ECE7DA"),
+        yaxis=dict(range=yr, title="相對動能（上面 = 越來越強）", zeroline=False, gridcolor="#ECE7DA"),
+        font=dict(family="Noto Sans TC, sans-serif", color="#1E2A33"),
+        hoverlabel=dict(bgcolor="#fff", font_size=13),
+    )
+
+
+def traces_for(ratio, mom, end, tickers, tail):
+    idx = ratio.index.get_loc(end)
+    sl = slice(max(0, idx - tail + 1), idx + 1)
+    out = []
+    for t in tickers:
+        xs, ys = ratio[t].iloc[sl], mom[t].iloc[sl]
+        c = COLORS[t]
+        out.append(go.Scatter(x=xs, y=ys, mode="lines+markers", line=dict(color=c, width=2, shape="spline"),
+                              marker=dict(size=[4] * (len(xs) - 1) + [0], color=c), hoverinfo="skip"))
+        out.append(go.Scatter(x=[xs.iloc[-1]], y=[ys.iloc[-1]], mode="markers+text",
+                              marker=dict(size=14, color=c, line=dict(color="#fff", width=2)),
+                              text=[SECTORS[t]], textposition="top center", textfont=dict(size=13, color=c),
+                              hovertemplate=f"<b>{SECTORS[t]} {t}</b><br>強度 %{{x:.2f}}<br>動能 %{{y:.2f}}<extra></extra>"))
+    return out
+
+
+# ---------------------------------------------------------------- 版面
+banner = img_uri("banner")
+st.markdown(f"""
+<div class="banner{'' if banner else ' noimg'}">
+  {f'<img src="{banner}" alt="白貓師父站在四季輪轉的石庭中央">' if banner else ''}
+  <div class="txt">
+    <h1>美股板塊輪動・四季輪轉</h1>
+    <p>資金像四季一樣在板塊之間輪流移動。選一個月份，看十一個板塊那時各自走到哪一季，也看它們是從哪裡轉過來的。</p>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
-
-st.set_page_config(page_title="美股板塊輪動 RRG（動畫版）", layout="wide")
-
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #0E1F2B; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-BENCHMARK = "SPY"
-SECTOR_ETFS = {
-    "XLK": "科技", "XLF": "金融", "XLE": "能源", "XLV": "醫療",
-    "XLI": "工業", "XLY": "非必需消費", "XLP": "必需消費",
-    "XLB": "原物料", "XLU": "公用事業", "XLRE": "房地產", "XLC": "通訊服務",
-}
-
-WEEKS = 65           # 模擬資料週數（要多留一些給rolling window吃掉）
-ANIM_FRAMES = 52     # 預設動畫frame數（取最近52週），可被下方時間區間選單覆蓋
-
-RANGE_OPTIONS = {"1個月": 4, "3個月": 13, "6個月": 26, "1年": 52}
-
-# 每個板塊的代表性重倉股（手動整理，非即時抓取的官方持股清單）。
-# 這份清單會過時，建議每季手動檢查一次是否需要更新；
-# 之後若要更精準，可以換成付費資料源即時拉取官方持股。
-SECTOR_CONSTITUENTS = {
-    "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "CRM", "ORCL"],
-    "XLF": ["JPM", "BAC", "WFC", "GS", "MS", "BLK"],
-    "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC"],
-    "XLV": ["UNH", "LLY", "JNJ", "ABBV", "MRK", "TMO"],
-    "XLI": ["CAT", "HON", "UNP", "RTX", "GE", "BA"],
-    "XLY": ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX"],
-    "XLP": ["PG", "KO", "PEP", "WMT", "COST", "PM"],
-    "XLB": ["LIN", "SHW", "FCX", "NEM", "APD", "ECL"],
-    "XLU": ["NEE", "DUK", "SO", "D", "AEP", "EXC"],
-    "XLRE": ["PLD", "AMT", "EQIX", "PSA", "O", "SPG"],
-    "XLC": ["META", "GOOGL", "NFLX", "DIS", "CMCSA", "TMUS"],
-}
-
-
-# ----------------------------------------------------------------------
-# 1. 資料層：真實資料版（yfinance），失敗時自動退回模擬資料
-# ----------------------------------------------------------------------
-def _mock_price_volume_data(tickers, weeks=WEEKS, seed=7):
-    """模擬資料，當yfinance抓不到資料時的備援，避免頁面直接壞掉。"""
-    rng = np.random.default_rng(seed)
-    out = {}
-
-    spy_close = 400 * np.exp(np.cumsum(rng.normal(0.002, 0.015, weeks)))
-    out[BENCHMARK] = pd.DataFrame({
-        "close": spy_close,
-        "volume": rng.normal(5e7, 5e6, weeks).clip(min=1e7),
-    })
-
-    for t in tickers:
-        drift = rng.normal(0.0, 0.0025)
-        cycle_len = rng.integers(12, 24)
-        phase = rng.uniform(0, 2 * np.pi)
-        noise = rng.normal(0, 0.018, weeks)
-        cycle = 0.012 * np.sin(np.linspace(0, weeks / cycle_len * 2 * np.pi, weeks) + phase)
-        rel_drift = drift + cycle + noise
-        close = spy_close[0] * 0.6 * np.exp(np.cumsum(rel_drift)) * (spy_close / spy_close[0]) ** 0.3
-
-        base_vol = rng.normal(1.5e7, 3e6, weeks).clip(min=1e6)
-        burst_weeks = rng.choice(weeks, size=rng.integers(2, 5), replace=False)
-        for bw in burst_weeks:
-            span = slice(max(0, bw - 1), min(weeks, bw + 2))
-            base_vol[span] *= rng.uniform(1.8, 3.2)
-
-        out[t] = pd.DataFrame({"close": close, "volume": base_vol})
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _download_yfinance_data(all_tickers: tuple, period: str = "2y", interval: str = "1wk"):
-    """實際打yfinance抓資料，快取1小時避免重複下載。"""
-    data = yf.download(list(all_tickers), period=period, interval=interval,
-                        group_by="ticker", progress=False, threads=True)
-    out = {}
-    for t in all_tickers:
-        try:
-            df = pd.DataFrame({
-                "close": data[t]["Close"],
-                "volume": data[t]["Volume"],
-            }).dropna()
-        except (KeyError, TypeError):
-            df = pd.DataFrame(columns=["close", "volume"])
-        out[t] = df
-    return out
-
-
-def fetch_price_volume_data(tickers, weeks=WEEKS, seed=7):
-    """
-    回傳 (dict[ticker] -> pd.DataFrame(columns=["close", "volume"]), is_mock: bool)。
-    優先使用yfinance真實股價；抓不到資料(離線/套件沒裝/API限流)時
-    自動退回模擬資料，並在頁面上顯示提示，不會讓App直接壞掉。
-    """
-    if not YFINANCE_AVAILABLE:
-        st.warning("尚未安裝 yfinance，目前顯示的是模擬資料。請在終端機執行："
-                    "`pip3 install yfinance` 後重新整理頁面。")
-        return _mock_price_volume_data(tickers, weeks, seed), True
-
-    all_tickers = tuple([BENCHMARK] + list(tickers))
-    try:
-        out = _download_yfinance_data(all_tickers)
-    except Exception as e:
-        st.warning(f"抓取yfinance資料時發生錯誤，暫時顯示模擬資料。錯誤訊息：{e}")
-        return _mock_price_volume_data(tickers, weeks, seed), True
-
-    # 檢查資料是否足夠（至少要有benchmark跟每檔ETF的資料）
-    if out.get(BENCHMARK, pd.DataFrame()).empty or all(out[t].empty for t in tickers):
-        st.warning("yfinance回傳的資料是空的（可能是網路問題或暫時被限流），"
-                    "目前顯示模擬資料，稍後可重新整理頁面再試一次。")
-        return _mock_price_volume_data(tickers, weeks, seed), True
-
-    return out, False
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _download_yfinance_daily(all_tickers: tuple, period: str = "15mo"):
-    """Trend Template要用日線(50/150/200日均線、52週高低點)，跟RRG的週線分開快取抓取。"""
-    data = yf.download(list(all_tickers), period=period, interval="1d",
-                        group_by="ticker", progress=False, threads=True)
-    out = {}
-    for t in all_tickers:
-        try:
-            df = pd.DataFrame({
-                "close": data[t]["Close"],
-                "volume": data[t]["Volume"],
-            }).dropna()
-        except (KeyError, TypeError):
-            df = pd.DataFrame(columns=["close", "volume"])
-        out[t] = df
-    return out
-
-
-def fetch_daily_data(tickers, weeks_as_days=380, seed=11):
-    """
-    回傳 (dict[ticker] -> pd.DataFrame(close, volume) 日線, is_mock: bool)。
-    邏輯跟 fetch_price_volume_data 一樣：優先真實資料，抓不到就退回模擬資料。
-    """
-    if not YFINANCE_AVAILABLE:
-        return _mock_price_volume_data(tickers, weeks_as_days, seed), True
-
-    all_tickers = tuple([BENCHMARK] + list(tickers))
-    try:
-        out = _download_yfinance_daily(all_tickers)
-    except Exception:
-        return _mock_price_volume_data(tickers, weeks_as_days, seed), True
-
-    if out.get(BENCHMARK, pd.DataFrame()).empty or all(out[t].empty for t in tickers):
-        return _mock_price_volume_data(tickers, weeks_as_days, seed), True
-
-    return out, False
-
-
-# ----------------------------------------------------------------------
-# 2. RS-Ratio / RS-Momentum / 資金流量大小 計算
-# ----------------------------------------------------------------------
-def compute_rrg_with_flow(prices: dict, benchmark: str, window: int = 10,
-                            mom_period: int = 4, flow_window: int = 6):
-    bench_close = prices[benchmark]["close"]
-    records = {}
-    for ticker, df in prices.items():
-        if ticker == benchmark:
-            continue
-        close = df["close"]
-        volume = df["volume"]
-
-        rs = close / bench_close
-        rs_z = (rs - rs.rolling(window).mean()) / rs.rolling(window).std()
-        rs_ratio = 100 + rs_z * 2
-
-        rs_ratio_chg = rs_ratio.diff(mom_period)
-        mom_z = (rs_ratio_chg - rs_ratio_chg.rolling(window).mean()) / rs_ratio_chg.rolling(window).std()
-        rs_momentum = 100 + mom_z * 2
-
-        dollar_flow = (close * volume).rolling(flow_window).mean()
-
-        rec = pd.DataFrame({
-            "rs_ratio": rs_ratio,
-            "rs_momentum": rs_momentum,
-            "dollar_flow": dollar_flow,
-        }).dropna()
-        records[ticker] = rec
-    return records
-
-
-def label_quadrant(x, y):
-    if x >= 100 and y >= 100:
-        return "領先 Leading"
-    if x >= 100 and y < 100:
-        return "轉弱 Weakening"
-    if x < 100 and y < 100:
-        return "落後 Lagging"
-    return "改善 Improving"
-
-
-QUADRANT_COLORS = {
-    "領先 Leading": "#3FA796",
-    "轉弱 Weakening": "#D4AF37",
-    "落後 Lagging": "#C0435A",
-    "改善 Improving": "#5B8DBE",
-}
-
-NAVY_BG = "#132A3A"
-NAVY_PANEL = "#0E1F2B"
-GOLD = "#D4AF37"
-GRID_LINE = "rgba(212,175,55,0.15)"
-
-
-# ----------------------------------------------------------------------
-# 2b. Trend Template（8條件）與大盤健康度
-# ----------------------------------------------------------------------
-def compute_trend_template(close: pd.Series) -> dict:
-    """
-    對照Joyce的黑帶Trend Template skill，用日線收盤價算出條件1-7
-    （條件8的RS另外用compute_rs_percentile算，因為要跟同組股票互相比較）。
-    資料不足200個交易日時回傳 None，避免算出不可靠的均線。
-    """
-    if len(close) < 210:
-        return None
-
-    price = close.iloc[-1]
-    sma50 = close.rolling(50).mean()
-    sma150 = close.rolling(150).mean()
-    sma200 = close.rolling(200).mean()
-
-    sma50_last = sma50.iloc[-1]
-    sma150_last = sma150.iloc[-1]
-    sma200_last = sma200.iloc[-1]
-    sma200_1m_ago = sma200.iloc[-22] if len(sma200.dropna()) > 22 else np.nan
-
-    high_52w = close.tail(252).max()
-    low_52w = close.tail(252).min()
-    pct_above_low = (price / low_52w - 1) * 100
-    pct_below_high = (1 - price / high_52w) * 100
-
-    cond = {
-        "c1_price_above_150_200": bool(price > sma150_last and price > sma200_last),
-        "c2_150_above_200": bool(sma150_last > sma200_last),
-        "c3_200_rising": bool(not np.isnan(sma200_1m_ago) and sma200_last > sma200_1m_ago),
-        "c4_50_above_150_200": bool(sma50_last > sma150_last and sma50_last > sma200_last),
-        "c5_price_above_50": bool(price > sma50_last),
-        "c6_30pct_above_52w_low": bool(pct_above_low >= 30),
-        "c7_within_25pct_of_52w_high": bool(pct_below_high <= 25),
-        "price": price,
-        "pct_above_52w_low": pct_above_low,
-        "pct_below_52w_high": pct_below_high,
-    }
-    cond["ma_structure_pass"] = all(cond[k] for k in
-                                     ["c1_price_above_150_200", "c2_150_above_200",
-                                      "c3_200_rising", "c4_50_above_150_200", "c5_price_above_50"])
-    cond["price_position_pass"] = cond["c6_30pct_above_52w_low"] and cond["c7_within_25pct_of_52w_high"]
-    return cond
-
-
-def compute_rs_percentile(closes: dict, spy_close: pd.Series, lookback: int = 252) -> dict:
-    """
-    近似版RS：算每檔股票過去lookback個交易日相對SPY的報酬，
-    再把這組股票互相排名轉成0-100百分位。
-    ⚠️ 這不是IBD那種全市場RS Rating，只是同一個板塊成分股之間的相對排名，僅供參考。
-    """
-    rel_returns = {}
-    spy_ret = spy_close.iloc[-1] / spy_close.iloc[-min(lookback, len(spy_close))] - 1
-    for ticker, close in closes.items():
-        if len(close) < min(lookback, 50):
-            continue
-        stock_ret = close.iloc[-1] / close.iloc[-min(lookback, len(close))] - 1
-        rel_returns[ticker] = stock_ret - spy_ret
-
-    if not rel_returns:
-        return {}
-    ranked = sorted(rel_returns.items(), key=lambda kv: kv[1])
-    n = len(ranked)
-    return {ticker: round((i + 1) / n * 100) for i, (ticker, _) in enumerate(ranked)}
-
-
-def compute_market_health(spy_close: pd.Series) -> dict:
-    """大盤（SPY）自己的健康度速覽：站不站得上50/200日均線、200日均線有沒有上揚。"""
-    if len(spy_close) < 210:
-        return {"label": "資料不足，暫無法判斷大盤健康度", "ok": None}
-
-    price = spy_close.iloc[-1]
-    sma50 = spy_close.rolling(50).mean().iloc[-1]
-    sma200_series = spy_close.rolling(200).mean()
-    sma200 = sma200_series.iloc[-1]
-    sma200_1m_ago = sma200_series.iloc[-22] if len(sma200_series.dropna()) > 22 else np.nan
-
-    above_50 = price > sma50
-    above_200 = price > sma200
-    rising_200 = not np.isnan(sma200_1m_ago) and sma200 > sma200_1m_ago
-
-    score = sum([above_50, above_200, rising_200])
-    if score == 3:
-        label = "大盤健康度：偏多頭。SPY站上50日與200日均線，200日均線持續上揚，適合積極尋找輪動機會。"
-        ok = True
-    elif score == 0:
-        label = "大盤健康度：偏空頭。SPY跌破50日與200日均線，200日均線走平或向下，建議以防守為主、放慢進場節奏。"
-        ok = False
-    else:
-        label = "大盤健康度：中性/轉換中。均線訊號不一致，建議個股輪動訊號要更嚴謹確認，不宜全面積極進攻。"
-        ok = None
-    return {"label": label, "ok": ok, "above_50": bool(above_50),
-            "above_200": bool(above_200), "rising_200": bool(rising_200)}
-
-
-# ----------------------------------------------------------------------
-# 3. 整理成動畫用的長格式資料
-# ----------------------------------------------------------------------
-def build_animation_frame_data(rrg_data: dict, name_map: dict, n_frames: int = ANIM_FRAMES,
-                                highlight_tickers: set = frozenset()):
-    rows = []
-    # 取所有ticker共同的最後 n_frames 個時間點
-    min_len = min(len(df) for df in rrg_data.values())
-    n_frames = min(n_frames, min_len)
-
-    week_labels = None
-    for ticker, df in rrg_data.items():
-        tail = df.tail(n_frames)
-        # 有真實日期索引(yfinance)就記錄下來，之後滑桿顯示真實週別而非序號
-        if week_labels is None:
-            try:
-                week_labels = [d.strftime("%Y-%m-%d") for d in tail.index]
-            except AttributeError:
-                week_labels = [str(i) for i in range(len(tail))]
-        tail = tail.reset_index(drop=True)
-        label = f"{ticker} {name_map[ticker]}" if ticker in name_map else ticker
-        symbol = "star" if ticker in highlight_tickers else "circle"
-        for i, row in tail.iterrows():
-            rows.append({
-                "week_idx": i,
-                "ticker": ticker,
-                "label": label,
-                "rs_ratio": row.rs_ratio,
-                "rs_momentum": row.rs_momentum,
-                "dollar_flow": row.dollar_flow,
-                "quadrant": label_quadrant(row.rs_ratio, row.rs_momentum),
-                "symbol": symbol,
-            })
-    long_df = pd.DataFrame(rows)
-
-    # 每個frame內部把資金流量正規化成泡泡大小(15~55)，才會有「大戶越多越大」的視覺對比
-    # 用 groupby().transform() 而不是 groupby().apply()，避免不同pandas版本在
-    # apply回傳DataFrame時把分組欄位處理成index，導致後面用不到 week_idx 欄位。
-    def _size_from_flow(s: pd.Series) -> pd.Series:
-        lo, hi = s.min(), s.max()
-        if hi - lo < 1e-9:
-            return pd.Series(30.0, index=s.index)
-        return 15 + 40 * (s - lo) / (hi - lo)
-
-    long_df["size"] = long_df.groupby("week_idx")["dollar_flow"].transform(_size_from_flow)
-    return long_df, n_frames, week_labels
-
-
-def compute_quadrant_streak(long_df: pd.DataFrame) -> dict:
-    """
-    回傳 {ticker: 已在目前象限連續停留的週數}。
-    從最新一週往回數，只要象限跟最新一週相同就繼續累加，
-    一遇到不同象限就停止——用來判斷「剛換象限」還是「已經穩定一段時間」。
-    """
-    streaks = {}
-    for ticker, g in long_df.groupby("ticker"):
-        g = g.sort_values("week_idx")
-        quadrants = g["quadrant"].tolist()
-        current = quadrants[-1]
-        streak = 0
-        for q in reversed(quadrants):
-            if q == current:
-                streak += 1
-            else:
-                break
-        streaks[ticker] = streak
-    return streaks
-
-
-def compute_transition_alerts(long_df: pd.DataFrame, lookback: int = 3) -> dict:
-    """
-    回傳 {ticker: {"from": 目前象限, "to": 推估下一步象限}}，
-    只包含「照最近lookback週的移動速度推算一步之後，會跨到不同象限」的標的——
-    用來提醒「快要換象限了」，不用等它真的跨過去才發現。
-    這是根據近期趨勢的簡單線性推估，不是預測，僅供提醒留意。
-    """
-    alerts = {}
-    for ticker, g in long_df.groupby("ticker"):
-        g = g.sort_values("week_idx")
-        if len(g) < lookback + 1:
-            continue
-        recent = g.tail(lookback + 1)
-        x0, x1 = recent.iloc[0]["rs_ratio"], recent.iloc[-1]["rs_ratio"]
-        y0, y1 = recent.iloc[0]["rs_momentum"], recent.iloc[-1]["rs_momentum"]
-        vx = (x1 - x0) / lookback
-        vy = (y1 - y0) / lookback
-        current_quadrant = recent.iloc[-1]["quadrant"]
-        projected_quadrant = label_quadrant(x1 + vx, y1 + vy)
-        if projected_quadrant != current_quadrant:
-            alerts[ticker] = {"from": current_quadrant, "to": projected_quadrant}
-    return alerts
-
-
-# ----------------------------------------------------------------------
-# 4. 動畫圖表
-#    重點：每支ETF固定用「同一條trace」貫穿所有frame（只更新座標/大小/顏色），
-#    這樣Plotly才能在frame之間做平滑補間(tween)，而不是每次重繪造成的跳動。
-#    象限只用來決定顏色，不能再拿來分組trace，否則每個frame的trace筆數
-#    會變動，補間就會失效、動畫就會頓。
-# ----------------------------------------------------------------------
-def build_animated_figure(long_df: pd.DataFrame, n_frames: int, ticker_order: list,
-                           week_labels: list = None):
-    if not week_labels or len(week_labels) != n_frames:
-        week_labels = [str(w) for w in range(n_frames)]
-    x_min, x_max = long_df.rs_ratio.min() - 1.5, long_df.rs_ratio.max() + 1.5
-    y_min, y_max = long_df.rs_momentum.min() - 1.5, long_df.rs_momentum.max() + 1.5
-
-    def make_ticker_traces(week_idx):
-        """
-        每支ETF產生一對 [光暈trace, 主體trace]，順序固定，
-        這樣兩條trace才能跟frame資料一一對應、做平滑補間。
-        """
-        d = long_df[long_df["week_idx"] == week_idx].set_index("ticker")
-        traces = []
-        for ticker in ticker_order:
-            row = d.loc[ticker]
-            color = QUADRANT_COLORS[row.quadrant]
-            size = row["size"]
-            symbol = row["symbol"]
-            is_custom = symbol == "star"
-            # 外層光暈：同座標、更大、更透明，做出立體光暈感
-            traces.append(go.Scatter(
-                x=[row.rs_ratio], y=[row.rs_momentum],
-                mode="markers",
-                marker=dict(size=[size * 1.7], color=color, opacity=0.20,
-                            symbol=symbol, line=dict(width=0)),
-                showlegend=False, hoverinfo="skip",
-            ))
-            # 內層主體：實色、細金邊、文字標籤
-            # 個股疊圖(highlight_tickers)用星形＋白色粗邊，跟板塊ETF的圓形區分開
-            traces.append(go.Scatter(
-                x=[row.rs_ratio], y=[row.rs_momentum],
-                mode="markers+text",
-                text=[row.label], textposition="top center",
-                textfont=dict(color="rgba(240,230,200,0.9)", size=12),
-                marker=dict(size=[size], color=color, opacity=0.92,
-                            sizemode="diameter", symbol=symbol,
-                            line=dict(width=2.4 if is_custom else 1.2,
-                                      color="#FFFFFF" if is_custom else "rgba(212,175,55,0.85)")),
-                showlegend=False,
-                hovertemplate=f"<b>{row.label}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Momentum: %{{y:.2f}}<extra></extra>",
-            ))
-        return traces
-
-    fig = go.Figure()
-
-    # 固定的圖例（跟動畫trace分開，避免象限切換時圖例跳動或重複）
-    for q, color in QUADRANT_COLORS.items():
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
-                                  marker=dict(size=11, color=color), name=q))
-
-    # 初始frame（第0週），接在圖例trace之後
-    for tr in make_ticker_traces(0):
-        fig.add_trace(tr)
-
-    # 四象限底色與標籤（固定不隨動畫變動）
-    fig.add_shape(type="rect", x0=100, x1=x_max, y0=100, y1=y_max,
-                  fillcolor="rgba(63,167,150,0.08)", line_width=0, layer="below")
-    fig.add_shape(type="rect", x0=100, x1=x_max, y0=y_min, y1=100,
-                  fillcolor="rgba(212,175,55,0.06)", line_width=0, layer="below")
-    fig.add_shape(type="rect", x0=x_min, x1=100, y0=y_min, y1=100,
-                  fillcolor="rgba(192,67,90,0.08)", line_width=0, layer="below")
-    fig.add_shape(type="rect", x0=x_min, x1=100, y0=100, y1=y_max,
-                  fillcolor="rgba(91,141,190,0.08)", line_width=0, layer="below")
-    fig.add_hline(y=100, line_color="rgba(212,175,55,0.35)", line_width=1)
-    fig.add_vline(x=100, line_color="rgba(212,175,55,0.35)", line_width=1)
-    for x, y, text in [
-        (x_max * 0.999, y_max * 0.999, "領先 Leading"),
-        (x_max * 0.999, y_min * 1.001, "轉弱 Weakening"),
-        (x_min * 1.001, y_min * 1.001, "落後 Lagging"),
-        (x_min * 1.001, y_max * 0.999, "改善 Improving"),
-    ]:
-        fig.add_annotation(x=x, y=y, text=text, showarrow=False,
-                            font=dict(size=12, color="rgba(212,175,55,0.55)"),
-                            xanchor="right" if x > 100 else "left",
-                            yanchor="top" if y > 100 else "bottom")
-
-    # 建立每一週的frame。每支ETF佔2條trace(光暈+主體)，圖例trace固定在最前面不變。
-    n_legend = len(QUADRANT_COLORS)
-    ticker_trace_idx = list(range(n_legend, n_legend + len(ticker_order) * 2))
-    frames = []
-    for w in range(n_frames):
-        frames.append(go.Frame(
-            data=make_ticker_traces(w), name=str(w), traces=ticker_trace_idx,
-        ))
-    fig.frames = frames
-
-    FRAME_MS = 550       # 每一幀的顯示間隔
-    TWEEN_MS = 500       # 補間動畫時長，越接近FRAME_MS越滑順
-
-    # 播放按鈕與時間滑桿
-    fig.update_layout(
-        paper_bgcolor=NAVY_BG,
-        plot_bgcolor=NAVY_PANEL,
-        font=dict(color="rgba(230,225,210,0.9)", family="Georgia, 'Noto Serif TC', serif"),
-        xaxis_title="RS-Ratio（相對大盤強度，100為中性）",
-        yaxis_title="RS-Momentum（強度變化動能，100為中性）",
-        xaxis=dict(range=[x_min, x_max], gridcolor=GRID_LINE, zerolinecolor=GRID_LINE),
-        yaxis=dict(range=[y_min, y_max], gridcolor=GRID_LINE, zerolinecolor=GRID_LINE),
-        height=720,
-        legend=dict(title="所在象限", bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="rgba(230,225,210,0.85)")),
-        # b=130 留足夠空間給下方的播放鍵、滑桿、以及滑桿下面的日期文字，
-        # 避免在手機窄螢幕上被切掉（之前 b=10 太小，日期文字會被裁掉）。
-        margin=dict(t=30, b=130),
-        updatemenus=[{
-            "type": "buttons",
-            "showactive": False,
-            "x": 0.05, "y": -0.14, "xanchor": "left", "yanchor": "top",
-            "buttons": [
-                {"label": "▶ 播放", "method": "animate",
-                 "args": [None, {"frame": {"duration": FRAME_MS, "redraw": False},
-                                  "fromcurrent": True,
-                                  "transition": {"duration": TWEEN_MS, "easing": "linear"}}]},
-                {"label": "⏸ 暫停", "method": "animate",
-                 "args": [[None], {"frame": {"duration": 0, "redraw": False},
-                                    "mode": "immediate", "transition": {"duration": 0}}]},
-            ],
-        }],
-        sliders=[{
-            "active": 0,
-            "x": 0.15, "y": -0.14, "len": 0.8,
-            "currentvalue": {"prefix": "", "visible": True,
-                              "font": {"size": 13, "color": "rgba(230,225,210,0.9)"}},
-            "pad": {"t": 20, "b": 10},
-            "steps": [
-                {"label": week_labels[w], "method": "animate",
-                 "args": [[str(w)], {"frame": {"duration": FRAME_MS, "redraw": False},
-                                      "mode": "immediate",
-                                      "transition": {"duration": TWEEN_MS, "easing": "linear"}}]}
-                for w in range(n_frames)
-            ],
-        }],
-    )
-    return fig
-
-
-# ----------------------------------------------------------------------
-# 5. Streamlit 頁面
-# ----------------------------------------------------------------------
-st.title("美股板塊輪動 RRG（動畫版）")
-
-_spy_daily, _spy_is_mock = fetch_daily_data([])
-_market_health = compute_market_health(_spy_daily.get(BENCHMARK, pd.DataFrame()).get("close", pd.Series(dtype=float)))
-if _market_health["ok"] is True:
-    st.success(_market_health["label"])
-elif _market_health["ok"] is False:
-    st.error(_market_health["label"])
-else:
-    st.info(_market_health["label"])
-
-tickers = list(SECTOR_ETFS.keys())
-
-custom_input = st.text_input(
-    "疊加你自己的持股(選填，用逗號分隔，例如 AAPL,TSLA)",
-    value="",
-    help="輸入的個股會用星形標記疊加在同一張圖上，跟你的持股比對，看它現在跟哪個板塊比較靠近、有沒有跟上輪動。",
-)
-custom_tickers = []
-for t in custom_input.split(","):
-    t = t.strip().upper()
-    if t and t not in tickers and t not in custom_tickers:
-        custom_tickers.append(t)
-
-tickers_all = tickers + custom_tickers
-prices, is_mock = fetch_price_volume_data(tickers_all)
-
-_data_note = "目前為模擬資料。" if is_mock else "資料來源：Yahoo Finance（yfinance），每小時更新一次。"
-st.caption(f"點下方「▶ 播放」看板塊如何隨時間在四象限間移動；泡泡大小＝資金流量（成交金額），資金湧入越多泡泡越大。{_data_note}")
-
-range_label = st.selectbox("時間區間", list(RANGE_OPTIONS.keys()), index=3)
-selected_frames = RANGE_OPTIONS[range_label]
-
-rrg = compute_rrg_with_flow(prices, BENCHMARK)
-
-# 個股代號打錯或資料不足時，跳過並提醒，不讓整頁掛掉
-dropped = [t for t in custom_tickers if len(rrg.get(t, [])) < 5]
-for t in dropped:
-    st.warning(f"「{t}」的資料不足或代號可能有誤，暫不會顯示在圖上。")
-    rrg.pop(t, None)
-custom_tickers = [t for t in custom_tickers if t not in dropped]
-ticker_order = [t for t in tickers_all if t in rrg]
-
-long_df, n_frames, week_labels = build_animation_frame_data(
-    rrg, SECTOR_ETFS, n_frames=selected_frames, highlight_tickers=set(custom_tickers),
-)
-
-fig = build_animated_figure(long_df, n_frames, ticker_order=ticker_order, week_labels=week_labels)
-st.plotly_chart(fig, use_container_width=True)
-
-alerts = compute_transition_alerts(long_df)
-if alerts:
-    lines = "\n".join(
-        f"- **{t}**：{a['from']} → {a['to']}（照近期走勢推估，僅供留意，非預測）"
-        for t, a in alerts.items()
-    )
-    st.warning(f"轉折警示：以下標的近期走勢，可能快要跨到不同象限\n\n{lines}")
-
-streaks = compute_quadrant_streak(long_df)
-
-with st.expander("查看目前(最新一週)各類股數值"):
-    last = long_df[long_df["week_idx"] == long_df["week_idx"].max()].copy()
-    last["象限停留週數"] = last["ticker"].map(streaks)
-    show = last[["ticker", "rs_ratio", "rs_momentum", "dollar_flow", "quadrant", "象限停留週數"]].copy()
-    show.columns = ["代號", "RS-Ratio", "RS-Momentum", "資金流量(估)", "所在象限", "象限停留週數"]
-    st.dataframe(show.sort_values("RS-Ratio", ascending=False), use_container_width=True)
-    st.caption("象限停留週數：目前這個象限已經連續待了幾週。數字越小代表剛換象限，通常是比較值得留意的轉折訊號。")
-
-st.subheader("板塊成分股：Trend Template 篩選")
-st.caption(
-    "選一個板塊，看它的代表性重倉股裡有哪幾檔通過黑帶Trend Template的8條門檻。"
-    "這份成分股清單是手動整理的代表性名單，不是即時官方持股；"
-    "第8條相對強度(RS)是同組股票互相比較的近似排名，不是全市場RS Rating。"
-)
-drilldown_sector = st.selectbox(
-    "選擇板塊", list(SECTOR_ETFS.keys()),
-    format_func=lambda t: f"{t} {SECTOR_ETFS[t]}",
-)
-if st.button("查詢成分股 Trend Template"):
-    constituents = SECTOR_CONSTITUENTS.get(drilldown_sector, [])
-    with st.spinner("正在抓取成分股日線資料..."):
-        daily_prices, daily_is_mock = fetch_daily_data(constituents)
-
-    spy_close = daily_prices.get(BENCHMARK, pd.DataFrame()).get("close", pd.Series(dtype=float))
-    closes = {t: daily_prices[t]["close"] for t in constituents
-              if t in daily_prices and not daily_prices[t].empty}
-    rs_pct = compute_rs_percentile(closes, spy_close)
-
-    rows = []
-    for t in constituents:
-        cond = compute_trend_template(closes.get(t, pd.Series(dtype=float)))
-        if cond is None:
-            rows.append({"代號": t, "現價": "-", "均線結構(1-5)": "資料不足",
-                         "股價位置(6-7)": "-", "RS百分位(近似)": "-", "8條全過": "-", "星級": "-"})
-            continue
-        ma_pass = cond["ma_structure_pass"]
-        pos_pass = cond["price_position_pass"]
-        rs = rs_pct.get(t)
-        rs_pass = rs is not None and rs >= 70
-        all_pass = ma_pass and pos_pass and rs_pass
-        star = "★★☆☆" if all_pass else "★☆☆☆"
-        rows.append({
-            "代號": t,
-            "現價": round(cond["price"], 2),
-            "均線結構(1-5)": "通過" if ma_pass else "未過",
-            "股價位置(6-7)": "通過" if pos_pass else "未過",
-            "RS百分位(近似)": f"{rs}" if rs is not None else "資料不足",
-            "8條全過": "✅" if all_pass else "—",
-            "星級": star,
-        })
-    result_df = pd.DataFrame(rows)
-    st.dataframe(result_df, use_container_width=True)
-    st.caption(
-        "星級只到★★☆☆（8條全過但VCP形態未自動判讀）——收縮型態偏主觀，"
-        "建議把8條全過的標的丟進黑帶Trend Template/VCP skill，人工複核VCP階段再決定要不要盯Pivot。"
-    )
-    if daily_is_mock:
-        st.caption("目前為模擬資料，數字僅供介面測試，非真實股價。")
-
-st.info(
-    "本工具僅彙整公開市場股價與成交量資訊做統計呈現，非投資顧問服務，"
-    "不對特定標的提供分析意見或推介建議，亦不構成任何投資建議；"
-    "投資人應自行判斷並自負盈虧。"
-)
+    with st.spinner("正在讀取最新的板塊資料…"):
+        close = load_prices()
+        ratio, mom = compute_rrg(close)
+except Exception:
+    st.error("暫時讀不到行情資料，可能是資料來源忙線。請過幾分鐘重新整理頁面。")
+    st.stop()
+
+if ratio.empty:
+    st.error("資料不足，無法計算輪動位置。請稍後再試。")
+    st.stop()
+
+ends = month_ends(ratio.index).iloc[-MONTHS_BACK:]
+labels = {p.strftime("%Y 年 %m 月"): d for p, d in ends.items()}
+label_list = list(labels)
+
+c1, c2, c3 = st.columns([2, 3, 2])
+with c1:
+    pick = st.selectbox("查詢月份", label_list[::-1], index=0)
+with c2:
+    chosen = st.multiselect("顯示板塊", list(SECTORS), default=list(SECTORS),
+                            format_func=lambda t: f"{SECTORS[t]} {t}")
+with c3:
+    tail = st.slider("軌跡長度（週）", 2, 12, 6)
+
+if not chosen:
+    st.info("至少選一個板塊，圖上才會有東西。")
+    st.stop()
+
+end = labels[pick]
+pos = label_list.index(pick)
+prev_end = labels[label_list[pos - 1]] if pos > 0 else None
+last_date = ratio.index[-1]
+st.markdown(f'<p class="note">資料計算到 {end:%Y/%m/%d} 當週｜比較基準：S&P 500（SPY）｜最新資料：{last_date:%Y/%m/%d}</p>', unsafe_allow_html=True)
+
+tab1, tab2, tab3 = st.tabs(["這個月的輪動", "播放三年輪動", "單一板塊的四季歷程"])
+
+# ---- 分頁一：當月
+with tab1:
+    xr, yr = axis_range(ratio.loc[:end].iloc[-tail:], mom.loc[:end].iloc[-tail:], chosen)
+    fig = go.Figure(traces_for(ratio, mom, end, chosen, tail), layout=base_layout(xr, yr))
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+    now = {t: season_of(ratio.at[end, t], mom.at[end, t]) for t in chosen}
+    before = {t: season_of(ratio.at[prev_end, t], mom.at[prev_end, t]) for t in chosen} if prev_end is not None else {}
+
+    st.markdown('<h3 class="serif">這個月，各板塊在哪一季</h3>', unsafe_allow_html=True)
+    cols = st.columns(4)
+    for col, key in zip(cols, ORDER):
+        s = SEASONS[key]
+        im = img_uri(s["img"])
+        items = []
+        for t in [t for t in chosen if now[t] == key]:
+            b = before.get(t)
+            moved = b is not None and b != key
+            mv = f"{SEASONS[b]['name']} → {s['name']}" if moved else ("持續" if b else "")
+            items.append(f'<li class="{"new" if moved else ""}"><span><span class="dot" style="background:{COLORS[t]}"></span>{SECTORS[t]}</span><span class="mv">{mv}</span></li>')
+        body = f"<ul>{''.join(items)}</ul>" if items else '<div class="empty">這個月沒有板塊在這一季。</div>'
+        pic = '<img src="{}" style="object-position:{}" alt="{}季的白貓師父">'.format(im, s["pos"], s["name"]) if im else ""
+        col.markdown(f"""<div class="season">{pic}
+            <div class="hd" style="color:{s['ink']}">{s['name']}<small>{s['label']}</small></div>
+            <div class="ds">{s['desc']}</div>{body}</div>""", unsafe_allow_html=True)
+
+    moved = [t for t in chosen if before and before.get(t) != now[t]]
+    if moved:
+        txt = "、".join(f"{SECTORS[t]}（{SEASONS[before[t]]['name']} → {SEASONS[now[t]]['name']}）" for t in moved)
+        st.markdown(f"**跟上個月比，換季的板塊：** {txt}")
+    elif before:
+        st.markdown("**跟上個月比，沒有板塊換季。**")
+
+# ---- 分頁二：動畫
+with tab2:
+    st.markdown('<p class="note">按下播放，一個月一個月看資金怎麼在板塊之間移動。軌跡長度跟上方設定一樣。</p>', unsafe_allow_html=True)
+    ends_list = list(labels.values())
+    first_i = ratio.index.get_loc(ends_list[0])
+    xr, yr = axis_range(ratio.iloc[max(0, first_i - tail):], mom.iloc[max(0, first_i - tail):], chosen)
+    frames = [go.Frame(data=traces_for(ratio, mom, d, chosen, tail), name=lbl) for lbl, d in labels.items()]
+    lay = base_layout(xr, yr, height=660)
+    lay["updatemenus"] = [dict(type="buttons", x=0, y=-0.1, xanchor="left", showactive=False, direction="left",
+                               buttons=[dict(label="▶ 播放", method="animate", args=[None, dict(frame=dict(duration=700, redraw=True), fromcurrent=True, transition=dict(duration=300))]),
+                                        dict(label="❚❚ 暫停", method="animate", args=[[None], dict(mode="immediate", frame=dict(duration=0, redraw=False))])])]
+    lay["sliders"] = [dict(active=0, x=0.18, len=0.82, y=-0.06, currentvalue=dict(prefix="", font=dict(size=16, family="Noto Serif TC, serif")),
+                           steps=[dict(label=l, method="animate", args=[[l], dict(mode="immediate", frame=dict(duration=0, redraw=True))]) for l in labels])]
+    lay["margin"]["b"] = 110
+    fig2 = go.Figure(data=frames[0].data, frames=frames, layout=lay)
+    st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
+
+# ---- 分頁三：單一板塊
+with tab3:
+    t = st.selectbox("選擇板塊", list(SECTORS), format_func=lambda t: f"{SECTORS[t]} {t}")
+    seq = [(lbl, season_of(ratio.at[d, t], mom.at[d, t])) for lbl, d in labels.items()]
+    cells = "".join(
+        f'<div title="{lbl}：{SEASONS[k]["name"]}・{SEASONS[k]["label"]}" style="flex:1; min-width:14px; height:42px; background:{SEASONS[k]["color"]}; border-right:1px solid #fff; display:flex; align-items:center; justify-content:center; font-family:Noto Serif TC,serif; font-weight:900; color:{SEASONS[k]["ink"]}; font-size:13px">{SEASONS[k]["name"]}</div>'
+        for lbl, k in seq)
+    st.markdown(f'<h3 class="serif">{SECTORS[t]}（{t}）過去三年每個月的季節</h3>'
+                f'<div style="display:flex; border-radius:4px; overflow:hidden; border:1px solid #E3DED0">{cells}</div>'
+                f'<div style="display:flex; justify-content:space-between" class="note"><span>{label_list[0]}</span><span>{label_list[-1]}</span></div>',
+                unsafe_allow_html=True)
+
+    counts = pd.Series([k for _, k in seq]).value_counts()
+    st.markdown("　".join(f"{SEASONS[k]['name']}：{counts.get(k, 0)} 個月" for k in ORDER))
+
+    changes = [f"{seq[i][0]}　{SEASONS[seq[i-1][1]]['name']} → {SEASONS[seq[i][1]]['name']}" for i in range(1, len(seq)) if seq[i][1] != seq[i - 1][1]]
+    with st.expander(f"換季紀錄（共 {len(changes)} 次）"):
+        st.markdown("\n".join(f"- {c}" for c in changes[::-1]) if changes else "這段期間沒有換季。")
+
+    s = ratio[t].loc[ends_list[0] - pd.Timedelta(weeks=tail):]
+    m = mom[t].loc[s.index]
+    fig3 = go.Figure()
+    fig3.add_scatter(x=s.index, y=s, name="相對強度", line=dict(color="#1A3A52", width=2))
+    fig3.add_scatter(x=m.index, y=m, name="相對動能", line=dict(color="#D4AF37", width=2))
+    fig3.add_hline(y=100, line_dash="dot", line_color="#999")
+    fig3.update_layout(height=320, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FBFAF5", margin=dict(l=40, r=20, t=10, b=30),
+                       legend=dict(orientation="h", y=1.1), font=dict(family="Noto Sans TC, sans-serif"),
+                       yaxis=dict(gridcolor="#ECE7DA"), xaxis=dict(gridcolor="#ECE7DA"))
+    st.plotly_chart(fig3, width="stretch", config={"displayModeBar": False})
+
+# ---------------------------------------------------------------- 說明
+with st.expander("怎麼看這張圖"):
+    st.markdown("""
+- 每個點是一個板塊，拿它跟 S&P 500 比。越往右，代表比大盤越強；越往上，代表強勢正在加速。
+- 板塊通常照 **春 → 夏 → 秋 → 冬** 的順時針方向輪轉，就像四季。
+- 尾巴是它過去幾週走過的路，看得出它正要往哪一季走。
+- 圖只告訴你資金大方向。板塊在夏季，不代表裡面每一檔都會漲；要不要買、什麼時候買，還是要回到個股的看盤和進場紀律。
+- 計算方式為 RRG（相對輪動圖）的近似算法，以週資料計算，數值與其他平台可能略有差異。
+""")
+
+st.markdown("""
+<div style="margin-top:2rem; padding:24px 28px; background:#1A3A52; border-radius:6px; color:#fff; display:flex; flex-wrap:wrap; gap:16px; align-items:center; justify-content:space-between">
+  <div><div style="font-family:'Noto Serif TC',serif; font-weight:900; font-size:22px">知道風往哪裡吹之後，下一步是找股票</div>
+  <div style="color:#C9D6DF; font-size:15px; margin-top:4px">強勢板塊裡，哪幾檔才值得研究？到第 2 站綠帶繼續練。</div></div>
+  <a href="https://usbbtrading.com/tools#s2" target="_blank" style="background:#D4AF37; color:#122B3D; font-weight:700; padding:12px 22px; border-radius:4px; text-decoration:none">下一站：找出值得研究的股票</a>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown('<p class="note" style="margin-top:2rem; text-align:center">AI 美股黑帶學院 US Stock Black Belt (USBB)　本工具僅供教育用途，不構成任何投資建議。投資有風險，請自行判斷並承擔盈虧。</p>', unsafe_allow_html=True)
