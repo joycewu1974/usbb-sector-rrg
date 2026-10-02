@@ -6,6 +6,7 @@ import base64
 from pathlib import Path
 
 import numpy as np
+import time
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -90,12 +91,44 @@ footer, #MainMenu{visibility:hidden}
 
 
 # ---------------------------------------------------------------- 資料
+def _download(tickers):
+    raw = yf.download(tickers, period="5y", interval="1wk", auto_adjust=True,
+                      progress=False, threads=False)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+    if not isinstance(close, pd.DataFrame):
+        close = close.to_frame()
+    if len(tickers) == 1:
+        close.columns = tickers
+    return close
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_prices() -> pd.DataFrame:
     tickers = list(SECTORS) + [BENCH]
-    raw = yf.download(tickers, period="5y", interval="1wk", auto_adjust=True, progress=False)
-    close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
-    return close.dropna(how="all").ffill()
+    close = _download(tickers)
+
+    # 有些代號會因為 Yahoo 限流整欄空白，逐一補抓
+    for attempt in range(3):
+        missing = [t for t in tickers if t not in close or close[t].dropna().empty]
+        if not missing:
+            break
+        time.sleep(2 * (attempt + 1))
+        for t in missing:
+            try:
+                one = _download([t])
+                if not one.empty and one[t].notna().any():
+                    close[t] = one[t]
+            except Exception:
+                pass
+
+    close = close.dropna(how="all").ffill()
+    good = [t for t in tickers if t in close and close[t].notna().any()]
+    # 大盤或一半以上板塊抓不到 → 丟錯誤，讓 cache 不要把壞資料存 6 小時
+    if BENCH not in good or len(good) - 1 < len(SECTORS) // 2:
+        raise RuntimeError(f"price download incomplete: {good}")
+    return close[good]
 
 
 def compute_rrg(close: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -103,14 +136,17 @@ def compute_rrg(close: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     bench = close[BENCH]
     ratio, mom = {}, {}
     for t in SECTORS:
-        if t not in close:
+        if t not in close or close[t].dropna().empty:
             continue
         rs = 100 * close[t] / bench
         r = 100 * rs.ewm(span=WINDOW).mean() / rs.rolling(WINDOW * 2).mean()
         m = 100 * r / r.rolling(MOM_WINDOW).mean()
         ratio[t], mom[t] = r, m
     ratio, mom = pd.DataFrame(ratio), pd.DataFrame(mom)
-    ok = ratio.notna().all(axis=1) & mom.notna().all(axis=1)
+    # 只丟掉前面暖機期的空值，不再因為單一板塊缺資料就整張清空
+    ratio = ratio.dropna(how="all")
+    mom = mom.reindex(ratio.index)
+    ok = mom.notna().any(axis=1)
     return ratio[ok], mom[ok]
 
 
@@ -201,12 +237,18 @@ try:
         close = load_prices()
         ratio, mom = compute_rrg(close)
 except Exception:
+    load_prices.clear()
     st.error("暫時讀不到行情資料，可能是資料來源忙線。請過幾分鐘重新整理頁面。")
     st.stop()
 
 if ratio.empty:
+    load_prices.clear()
     st.error("資料不足，無法計算輪動位置。請稍後再試。")
     st.stop()
+
+missing_sectors = [t for t in SECTORS if t not in ratio.columns]
+if missing_sectors:
+    st.caption("這次有幾個板塊暫時抓不到資料：" + "、".join(SECTORS[t] for t in missing_sectors))
 
 ends = month_ends(ratio.index).iloc[-MONTHS_BACK:]
 labels = {p.strftime("%Y 年 %m 月"): d for p, d in ends.items()}
@@ -216,7 +258,7 @@ c1, c2, c3 = st.columns([2, 3, 2])
 with c1:
     pick = st.selectbox("查詢月份", label_list[::-1], index=0)
 with c2:
-    chosen = st.multiselect("顯示板塊", list(SECTORS), default=list(SECTORS),
+    chosen = st.multiselect("顯示板塊", list(ratio.columns), default=list(ratio.columns),
                             format_func=lambda t: f"{SECTORS[t]} {t}")
 with c3:
     tail = st.slider("軌跡長度（週）", 2, 12, 6)
